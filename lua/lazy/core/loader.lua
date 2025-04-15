@@ -44,6 +44,7 @@ function M.setup()
     while M.install_missing() do
       count = count + 1
       if count > 5 then
+        Util.error("Too many rounds of missing plugins")
         break
       end
     end
@@ -66,7 +67,10 @@ end
 -- multiple rounds can happen when importing a spec from a missing plugin
 function M.install_missing()
   for _, plugin in pairs(Config.plugins) do
-    if not (plugin._.installed or Plugin.has_errors(plugin)) then
+    local installed = plugin._.installed
+    local has_errors = Plugin.has_errors(plugin)
+
+    if not has_errors and not (installed and not plugin._.build) then
       for _, colorscheme in ipairs(Config.options.install.colorscheme) do
         if colorscheme == "default" then
           break
@@ -100,7 +104,7 @@ function M.startup()
   M.source(vim.env.VIMRUNTIME .. "/filetype.lua")
 
   -- backup original rtp
-  local rtp = vim.opt.rtp:get()
+  local rtp = vim.opt.rtp:get() --[[@as string[] ]]
 
   -- 1. run plugin init
   Util.track({ start = "init" })
@@ -131,7 +135,7 @@ function M.startup()
     if not path:find("after/?$") then
       -- these paths don't will already have their ftdetect ran,
       -- by sourcing filetype.lua above, so skip them
-      M.did_ftdetect[path] = true
+      M.did_ftdetect[path] = path
       M.packadd(path)
     end
   end
@@ -139,7 +143,9 @@ function M.startup()
 
   -- 4. load after plugins
   Util.track({ start = "after" })
-  for _, path in ipairs(vim.opt.rtp:get()) do
+  for _, path in
+    ipairs(vim.opt.rtp:get() --[[@as string[] ]])
+  do
     if path:find("after/?$") then
       M.source_runtime(path, "plugin")
     end
@@ -155,7 +161,7 @@ function M.get_start_plugins()
   ---@type LazyPlugin[]
   local start = {}
   for _, plugin in pairs(Config.plugins) do
-    if plugin.lazy == false and not plugin._.loaded then
+    if not plugin._.loaded and (plugin._.rtp_loaded or plugin.lazy == false) then
       start[#start + 1] = plugin
     end
   end
@@ -335,7 +341,13 @@ function M._load(plugin, reason, opts)
   Util.track({ plugin = plugin.name, start = reason.start })
   Handler.disable(plugin)
 
-  M.add_to_rtp(plugin)
+  if not plugin.virtual then
+    M.add_to_rtp(plugin)
+  end
+
+  if plugin._.pkg and plugin._.pkg.source == "rockspec" then
+    M.add_to_luapath(plugin)
+  end
 
   if plugin.dependencies then
     Util.try(function()
@@ -343,7 +355,9 @@ function M._load(plugin, reason, opts)
     end, "Failed to load deps for " .. plugin.name)
   end
 
-  M.packadd(plugin.dir)
+  if not plugin.virtual then
+    M.packadd(plugin.dir)
+  end
   if plugin.config or plugin.opts then
     M.config(plugin)
   end
@@ -454,10 +468,8 @@ function M.add_to_rtp(plugin)
   local rtp = vim.api.nvim_get_runtime_file("", true)
   local idx_dir, idx_after
 
-  local is_win = jit.os:find("Windows")
-
   for i, path in ipairs(rtp) do
-    if is_win then
+    if Util.is_win then
       path = Util.norm(path)
     end
     if path == Config.me then
@@ -476,7 +488,20 @@ function M.add_to_rtp(plugin)
     table.insert(rtp, idx_after or (#rtp + 1), after)
   end
 
+  ---@type vim.Option
   vim.opt.rtp = rtp
+end
+
+---@param plugin LazyPlugin
+function M.add_to_luapath(plugin)
+  local root = Config.options.rocks.root .. "/" .. plugin.name
+  local path = root .. "/share/lua/5.1"
+  local cpath = root .. "/lib/lua/5.1"
+  local cpath2 = root .. "/lib64/lua/5.1"
+
+  package.path = package.path .. ";" .. path .. "/?.lua;" .. path .. "/?/init.lua;"
+  package.cpath = package.cpath .. ";" .. cpath .. "/?." .. (jit.os:find("Windows") and "dll" or "so") .. ";"
+  package.cpath = package.cpath .. ";" .. cpath2 .. "/?." .. (jit.os:find("Windows") and "dll" or "so") .. ";"
 end
 
 function M.source(path)
@@ -504,8 +529,8 @@ function M.colorscheme(name)
 end
 
 function M.auto_load(modname, modpath)
-  local plugin = Plugin.find(modpath)
-  if plugin and modpath:find(plugin.dir, 1, true) == 1 then
+  local plugin = Plugin.find(modpath, { fast = not M.did_handlers })
+  if plugin then
     plugin._.rtp_loaded = true
     -- don't load if:
     -- * handlers haven't been setup yet
@@ -525,9 +550,17 @@ end
 
 ---@param modname string
 function M.loader(modname)
-  local paths = Util.get_unloaded_rtp(modname)
+  local paths, cached = Util.get_unloaded_rtp(modname, { cache = true })
   local ret = Cache.find(modname, { rtp = false, paths = paths })[1]
+
+  if not ret and cached then
+    paths = Util.get_unloaded_rtp(modname)
+    ret = Cache.find(modname, { rtp = false, paths = paths })[1]
+  end
+
   if ret then
+    -- explicitly set to nil to prevent loading errors
+    package.loaded[modname] = nil
     M.auto_load(modname, ret.modpath)
     local mod = package.loaded[modname]
     if type(mod) == "table" then

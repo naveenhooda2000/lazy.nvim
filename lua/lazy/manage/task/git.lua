@@ -1,7 +1,53 @@
+local Async = require("lazy.async")
 local Config = require("lazy.core.config")
 local Git = require("lazy.manage.git")
 local Lock = require("lazy.manage.lock")
 local Util = require("lazy.util")
+
+local throttle = {}
+throttle.running = 0
+throttle.waiting = {} ---@type Async[]
+throttle.timer = vim.uv.new_timer()
+
+function throttle.next()
+  throttle.running = 0
+  while #throttle.waiting > 0 and throttle.running < Config.options.git.throttle.rate do
+    ---@type Async
+    local task = table.remove(throttle.waiting, 1)
+    task:resume()
+    throttle.running = throttle.running + 1
+  end
+  if throttle.running == 0 then
+    throttle.timer:stop()
+  end
+end
+
+function throttle.wait()
+  if not Config.options.git.throttle.enabled then
+    return
+  end
+  if not throttle.timer:is_active() then
+    throttle.timer:start(0, Config.options.git.throttle.duration, vim.schedule_wrap(throttle.next))
+  end
+  local running = Async.running()
+  if throttle.running < Config.options.git.throttle.rate then
+    throttle.running = throttle.running + 1
+  else
+    table.insert(throttle.waiting, running)
+    coroutine.yield("waiting")
+    running:suspend()
+    coroutine.yield("")
+  end
+end
+
+---@param plugin LazyPlugin
+local function cooldown(plugin)
+  if not plugin._.last_check then
+    return false
+  end
+  local delta = (vim.uv.now() - plugin._.last_check) / 1000
+  return delta < Config.options.git.cooldown
+end
 
 ---@type table<string, LazyTaskDef>
 local M = {}
@@ -18,8 +64,10 @@ M.log = {
     local stat = vim.uv.fs_stat(plugin.dir .. "/.git")
     return not (stat and stat.type == "directory")
   end,
+  ---@async
   ---@param opts {args?: string[], updated?:boolean, check?:boolean}
   run = function(self, opts)
+    -- self:spawn({ "sleep", "5" })
     local args = {
       "log",
       "--pretty=format:%h %s (%cr)",
@@ -30,11 +78,13 @@ M.log = {
       "--no-show-signature",
     }
 
+    local info, target
+
     if opts.updated then
       table.insert(args, self.plugin._.updated.from .. ".." .. (self.plugin._.updated.to or "HEAD"))
     elseif opts.check then
-      local info = assert(Git.info(self.plugin.dir))
-      local target = assert(Git.get_target(self.plugin))
+      info = assert(Git.info(self.plugin.dir))
+      target = assert(Git.get_target(self.plugin))
       if not target.commit then
         for k, v in pairs(target) do
           error(k .. " '" .. v .. "' not found")
@@ -42,15 +92,17 @@ M.log = {
         error("no target commit found")
       end
       assert(target.commit, self.plugin.name .. " " .. target.branch)
-      if Git.eq(info, target) then
-        if Config.options.checker.check_pinned then
-          local last_commit = Git.get_commit(self.plugin.dir, target.branch, true)
-          if not Git.eq(info, { commit = last_commit }) then
-            self.plugin._.outdated = true
+      if not self.plugin._.is_local then
+        if Git.eq(info, target) then
+          if Config.options.checker.check_pinned then
+            local last_commit = Git.get_commit(self.plugin.dir, target.branch, true)
+            if not Git.eq(info, { commit = last_commit }) then
+              self.plugin._.outdated = true
+            end
           end
+        else
+          self.plugin._.updates = { from = info, to = target }
         end
-      else
-        self.plugin._.updates = { from = info, to = target }
       end
       table.insert(args, info.commit .. ".." .. target.commit)
     else
@@ -61,6 +113,14 @@ M.log = {
       args = args,
       cwd = self.plugin.dir,
     })
+
+    -- for local plugins, mark as needing updates only if local is
+    -- behind upstream, i.e. if git log gave no output
+    if opts.check and self.plugin._.is_local then
+      if not vim.tbl_isempty(self:get_log()) then
+        self.plugin._.updates = { from = info, to = target }
+      end
+    end
   end,
 }
 
@@ -68,7 +128,9 @@ M.clone = {
   skip = function(plugin)
     return plugin._.installed or plugin._.is_local
   end,
+  ---@async
   run = function(self)
+    throttle.wait()
     local args = {
       "clone",
       self.plugin.url,
@@ -83,6 +145,12 @@ M.clone = {
     end
 
     args[#args + 1] = "--origin=origin"
+
+    -- If git config --global core.autocrlf is true on a Unix/Linux system, then the git clone
+    -- process will lead to files with CRLF endings. Vi / vim / neovim cannot handle this.
+    -- Force git to clone with core.autocrlf=false.
+    args[#args + 1] = "-c"
+    args[#args + 1] = "core.autocrlf=false"
 
     args[#args + 1] = "--progress"
 
@@ -121,8 +189,9 @@ M.branch = {
       return true
     end
     local branch = assert(Git.get_branch(plugin))
-    return Git.get_commit(plugin.dir, branch)
+    return Git.get_commit(plugin.dir, branch, true)
   end,
+  ---@async
   run = function(self)
     local args = {
       "remote",
@@ -148,14 +217,17 @@ M.origin = {
     local origin = Git.get_origin(plugin.dir)
     return origin == plugin.url
   end,
+  ---@async
   ---@param opts {check?:boolean}
   run = function(self, opts)
     if opts.check then
       local origin = Git.get_origin(self.plugin.dir)
-      self.error = "Origin has changed:\n"
-      self.error = self.error .. "  * old: " .. origin .. "\n"
-      self.error = self.error .. "  * new: " .. self.plugin.url .. "\n"
-      self.error = self.error .. "Please run update to fix"
+      self:error({
+        "Origin has changed:",
+        "  * old: " .. origin,
+        "  * new: " .. self.plugin.url,
+        "Please run update to fix",
+      })
       return
     end
     require("lazy.manage.task.fs").clean.run(self, opts)
@@ -167,6 +239,7 @@ M.status = {
   skip = function(plugin)
     return not plugin._.installed or plugin._.is_local
   end,
+  ---@async
   run = function(self)
     self:spawn("git", {
       args = { "ls-files", "-d", "-m" },
@@ -174,6 +247,7 @@ M.status = {
       on_exit = function(ok, output)
         if ok then
           local lines = vim.split(output, "\n")
+          ---@type string[]
           lines = vim.tbl_filter(function(line)
             -- Fix doc/tags being marked as modified
             if line:gsub("[\\/]", "/") == "doc/tags" then
@@ -184,12 +258,13 @@ M.status = {
             return line ~= ""
           end, lines)
           if #lines > 0 then
-            self.error = "You have local changes in `" .. self.plugin.dir .. "`:\n"
+            local msg = { "You have local changes in `" .. self.plugin.dir .. "`:" }
             for _, line in ipairs(lines) do
-              self.error = self.error .. "  * " .. line .. "\n"
+              msg[#msg + 1] = "  * " .. line
             end
-            self.error = self.error .. "Please remove them to update.\n"
-            self.error = self.error .. "You can also press `x` to remove the plugin and then `I` to install it again."
+            msg[#msg + 1] = "Please remove them to update."
+            msg[#msg + 1] = "You can also press `x` to remove the plugin and then `I` to install it again."
+            self:error(msg)
           end
         end
       end,
@@ -200,10 +275,12 @@ M.status = {
 -- fetches all needed origin branches
 M.fetch = {
   skip = function(plugin)
-    return not plugin._.installed or plugin._.is_local
+    return not plugin._.installed or plugin._.is_local or cooldown(plugin)
   end,
 
+  ---@async
   run = function(self)
+    throttle.wait()
     local args = {
       "fetch",
       "--recurse-submodules",
@@ -219,6 +296,11 @@ M.fetch = {
     self:spawn("git", {
       args = args,
       cwd = self.plugin.dir,
+      on_exit = function(ok)
+        if ok then
+          self.plugin._.last_check = vim.uv.now()
+        end
+      end,
     })
   end,
 }
@@ -230,8 +312,10 @@ M.checkout = {
     return not plugin._.installed or plugin._.is_local
   end,
 
+  ---@async
   ---@param opts {lockfile?:boolean}
   run = function(self, opts)
+    throttle.wait()
     local info = assert(Git.info(self.plugin.dir))
     local target = assert(Git.get_target(self.plugin))
 
@@ -251,7 +335,7 @@ M.checkout = {
       end
     end
 
-    -- dont run checkout if target is already reached.
+    -- don't run checkout if target is already reached.
     -- unless we just cloned, since then we won't have any data yet
     if Git.eq(info, target) and info.branch == target.branch then
       self.plugin._.updated = {
